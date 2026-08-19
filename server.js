@@ -12,6 +12,13 @@ const supabase = createClient(
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
 const LEARNING_STYLES = ["audio", "visual", "kinesthetic"];
 
+for (const key of ["ATLAS_BOT_TOKEN", "SUPABASE_URL", "SUPABASE_KEY", "PUBLIC_BASE_URL"]) {
+  if (!process.env[key]) {
+    console.error(`Missing required env var: ${key}. Set it in your deployment platform's config, not just .env.`);
+    process.exit(1);
+  }
+}
+
 // proxies media_assets storage objects under our own domain so the
 // Supabase project URL is never shown to or hit directly by the user
 async function serveMedia(req, res) {
@@ -30,12 +37,13 @@ async function serveMedia(req, res) {
     return;
   }
 
-  const { data: publicUrl } = supabase
-    .storage
-    .from(asset.bucket)
-    .getPublicUrl(asset.storage_path);
+  // storage_path is usually a path relative to the bucket, but some rows
+  // have the full public URL written in by mistake — handle both
+  const assetUrl = /^https?:\/\//i.test(asset.storage_path)
+    ? asset.storage_path
+    : supabase.storage.from(asset.bucket).getPublicUrl(asset.storage_path).data.publicUrl;
 
-  const upstream = await fetch(publicUrl.publicUrl);
+  const upstream = await fetch(assetUrl);
   if (!upstream.ok || !upstream.body) {
     res.writeHead(502, { "Content-Type": "text/plain" });
     res.end("Failed to fetch media");
@@ -193,8 +201,9 @@ async function handleTopicRequest(ctx, topic) {
       `✅ *${asset.title}*\n\n${asset.description}\n\n📎 Listen here:\n${asset.url}\n\n` +
       `What would you like to do next?`,
       [
-        { label: "🎓 Find a new topic", value: "/findcourse" },
-        { label: "🏠 Back to start",    value: "/start"      }
+        { label: "🎓 Find a new topic",       value: "/findcourse" },
+        { label: "🔀 Change learning style",  value: "/style"      },
+        { label: "🏠 Back to start",          value: "/start"      }
       ]
     );
     return;
@@ -387,6 +396,7 @@ bot.onCommand("getformat", async (ctx) => {
       [
         { label: "🔄 Different format, same topic", value: `/findcourse` },
         { label: "🎓 Find a new topic",              value: `/findcourse` },
+        { label: "🔀 Change learning style",         value: `/style`     },
         { label: "🏠 Back to start",                 value: `/start`     }
       ]
     );
