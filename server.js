@@ -1,4 +1,13 @@
 import { createAtlasBot } from "atlas-bot-sdk";
+import http from "node:http";
+
+const PORT = process.env.PORT || 3000;
+http
+  .createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("Intellibus Academy Bot is running.");
+  })
+  .listen(PORT, () => console.log(`Health check server listening on port ${PORT}`));
 
 const bot = createAtlasBot({
   accessToken: process.env.ATLAS_BOT_TOKEN,
@@ -68,7 +77,7 @@ bot.onCommand("start", async (ctx) => {
 bot.onCommand("findcourse", async (ctx) => {
   await ctx.sendText(
     "What topic or subject would you like to learn about?\n\n" +
-    "For example: *Project Management*, *Python Programming*, *Public Speaking*"
+    "For example: *Project Management*, *Python Programming*, *Postman API Testing*"
   );
 });
 
