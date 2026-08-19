@@ -178,16 +178,27 @@ async function serveMedia(req, res) {
     return;
   }
 
-  const upstream = await fetch(assetUrl);
+  // forward Range so players can seek/probe before playing — without this
+  // every request gets the full file back with no Accept-Ranges, and chat
+  // clients that range-probe before playback treat that as unplayable
+  const rangeHeader = req.headers.range;
+  const upstream = await fetch(assetUrl, rangeHeader ? { headers: { Range: rangeHeader } } : {});
   if (!upstream.ok || !upstream.body) {
     res.writeHead(502, { "Content-Type": "text/plain" });
     res.end("Failed to fetch media");
     return;
   }
 
-  res.writeHead(200, {
-    "Content-Type": asset.mime_type || upstream.headers.get("content-type") || "application/octet-stream"
-  });
+  const headers = {
+    "Content-Type": asset.mime_type || upstream.headers.get("content-type") || "application/octet-stream",
+    "Accept-Ranges": "bytes"
+  };
+  const contentRange = upstream.headers.get("content-range");
+  const contentLength = upstream.headers.get("content-length");
+  if (contentRange) headers["Content-Range"] = contentRange;
+  if (contentLength) headers["Content-Length"] = contentLength;
+
+  res.writeHead(upstream.status === 206 ? 206 : 200, headers);
   Readable.fromWeb(upstream.body).pipe(res);
 }
 
