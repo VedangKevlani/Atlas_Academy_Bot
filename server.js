@@ -1,5 +1,12 @@
+import "dotenv/config";
 import { createAtlasBot } from "atlas-bot-sdk";
+import { createClient } from "@supabase/supabase-js";
 import http from "node:http";
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_KEY
+);
 
 const PORT = process.env.PORT || 3000;
 http
@@ -32,7 +39,7 @@ bot.tools.register("find_course_content", {
       },
       format: {
         type: "string",
-        enum: ["infographic", "video", "slide_deck", "audio", "flashcards", "quiz"],
+        enum: ["infographic", "video", "slide_deck", "audio"],
         description: "The content format the user selected"
       }
     },
@@ -40,25 +47,56 @@ bot.tools.register("find_course_content", {
   },
   handler: async ({ topic, format }) => {
 
+    // paths.topic groups content; media_assets.asset_type stores the format,
+    // but under "deck" rather than "slide_deck"
+    const assetType = format === "slide_deck" ? "deck" : format;
 
-    const formatLabels = {
-      infographic: "Infographic",
-      video:       "Video",
-      slide_deck:  "Slide Deck",
-      audio:       "Audio",
-      flashcards:  "Flashcards",
-      quiz:        "Quiz"
-    };
+    const { data: path, error: pathError } = await supabase
+      .from("paths")
+      .select("id")
+      .ilike("topic", topic)
+      .eq("is_published", true)
+      .maybeSingle();
+
+    if (pathError) {
+      console.error("Supabase path lookup failed:", pathError.message);
+      return { found: false, topic, format };
+    }
+
+    if (!path) {
+      return { found: false, topic, format };
+    }
+
+    const { data: asset, error: assetError } = await supabase
+      .from("media_assets")
+      .select("title, description, bucket, storage_path")
+      .eq("path_id", path.id)
+      .eq("asset_type", assetType)
+      .eq("is_published", true)
+      .maybeSingle();
+
+    if (assetError) {
+      console.error("Supabase media asset lookup failed:", assetError.message);
+      return { found: false, topic, format };
+    }
+
+    if (!asset) {
+      return { found: false, topic, format };
+    }
+
+    const { data: publicUrl } = supabase
+      .storage
+      .from(asset.bucket)
+      .getPublicUrl(asset.storage_path);
 
     return {
       found: true,
       topic,
-      format: formatLabels[format],
-      title: `${topic} — ${formatLabels[format]}`,
-      description: `A ${formatLabels[format].toLowerCase()} covering the key concepts of ${topic}.`,
-      url: `https://intellibus.academy/content/${topic.toLowerCase().replace(/ /g, "-")}/${format}`
+      format,
+      title: asset.title,
+      description: asset.description,
+      url: publicUrl.publicUrl
     };
-    // End of section to replace 
   }
 });
 
@@ -90,9 +128,7 @@ bot.onCommand("help", async (ctx) => {
     "   1. 🖼️  Infographic\n" +
     "   2. 🎬  Video\n" +
     "   3. 📊  Slide Deck\n" +
-    "   4. 🎧  Audio\n" +
-    "   5. 🗂️  Flashcards\n" +
-    "   6. 📝  Quiz\n\n" +
+    "   4. 🎧  Audio\n\n" +
     "Just tell me what you want to learn and I'll guide you from there."
   );
 });
@@ -123,9 +159,7 @@ bot.onMessage(async (ctx) => {
               { label: "🖼️  Infographic", value: `/getformat infographic ${topic}` },
               { label: "🎬  Video",        value: `/getformat video ${topic}`       },
               { label: "📊  Slide Deck",   value: `/getformat slide_deck ${topic}`  },
-              { label: "🎧  Audio",        value: `/getformat audio ${topic}`       },
-              { label: "🗂️  Flashcards",  value: `/getformat flashcards ${topic}`  },
-              { label: "📝  Quiz",         value: `/getformat quiz ${topic}`        }
+              { label: "🎧  Audio",        value: `/getformat audio ${topic}`       }
             ]
           );
           return { offered: true, topic };
