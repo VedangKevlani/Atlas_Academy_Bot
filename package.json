@@ -1,0 +1,16 @@
+{
+  "name": "atlas-academy-bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "type": "module",
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "atlas-bot-sdk": "^0.1.1"
+  }
+}
