@@ -19,6 +19,106 @@ for (const key of ["ATLAS_BOT_TOKEN", "SUPABASE_URL", "SUPABASE_KEY", "PUBLIC_BA
   }
 }
 
+const HLS_MIME_TYPES = new Set(["application/x-mpegurl", "application/vnd.apple.mpegurl"]);
+
+function renderHlsPlayer(src) {
+  const escapedSrc = src.replace(/"/g, "&quot;");
+  return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Video</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; }
+  video { width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<video id="player" controls autoplay playsinline></video>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+<script>
+  const src = "${escapedSrc}";
+  const video = document.getElementById("player");
+  if (video.canPlayType("application/vnd.apple.mpegurl")) {
+    video.src = src;
+  } else if (window.Hls && Hls.isSupported()) {
+    const hls = new Hls();
+    hls.loadSource(src);
+    hls.attachMedia(video);
+  } else {
+    document.body.textContent = "Your browser can't play this video.";
+  }
+</script>
+</body>
+</html>`;
+}
+
+// strips a bucket's public-URL prefix off storage_path when it's a full URL,
+// so it's always safe to hand to supabase.storage.from(bucket).list(...)
+function relativeStoragePath(asset) {
+  if (!/^https?:\/\//i.test(asset.storage_path)) return asset.storage_path;
+  const marker = `/object/public/${asset.bucket}/`;
+  const idx = asset.storage_path.indexOf(marker);
+  return idx >= 0 ? asset.storage_path.slice(idx + marker.length) : asset.storage_path;
+}
+
+function renderSlideDeckViewer(slideUrls) {
+  const slidesJson = JSON.stringify(slideUrls).replace(/</g, "\\u003c");
+  return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Slide Deck</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #eee; font-family: system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  #stage { flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; position: relative; }
+  #stage img { max-width: 100%; max-height: 100%; object-fit: contain; }
+  #bar { display: flex; align-items: center; justify-content: center; gap: 16px; padding: 12px; background: #000; }
+  button { background: #333; color: #eee; border: none; border-radius: 6px; padding: 8px 16px; font-size: 16px; cursor: pointer; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  #counter { min-width: 4em; text-align: center; }
+</style>
+</head>
+<body>
+<div id="stage"><img id="slide" alt="Slide"></div>
+<div id="bar">
+  <button id="prev">‹ Prev</button>
+  <span id="counter"></span>
+  <button id="next">Next ›</button>
+</div>
+<script>
+  const slides = ${slidesJson};
+  let i = 0;
+  const img = document.getElementById("slide");
+  const counter = document.getElementById("counter");
+  const prevBtn = document.getElementById("prev");
+  const nextBtn = document.getElementById("next");
+
+  function render() {
+    img.src = slides[i];
+    counter.textContent = (i + 1) + " / " + slides.length;
+    prevBtn.disabled = i === 0;
+    nextBtn.disabled = i === slides.length - 1;
+  }
+  function go(delta) {
+    i = Math.min(slides.length - 1, Math.max(0, i + delta));
+    render();
+  }
+  prevBtn.addEventListener("click", () => go(-1));
+  nextBtn.addEventListener("click", () => go(1));
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowLeft") go(-1);
+    if (e.key === "ArrowRight") go(1);
+  });
+  render();
+</script>
+</body>
+</html>`;
+}
+
 // proxies media_assets storage objects under our own domain so the
 // Supabase project URL is never shown to or hit directly by the user
 async function serveMedia(req, res) {
@@ -37,11 +137,46 @@ async function serveMedia(req, res) {
     return;
   }
 
+  // some decks are stored as a folder of numbered slide images rather than
+  // a single file — storage_path ends in "/" for those, list and view them
+  if (asset.storage_path.endsWith("/")) {
+    const folder = relativeStoragePath(asset).replace(/\/$/, "");
+    const { data: files, error: listError } = await supabase.storage.from(asset.bucket).list(folder);
+
+    if (listError || !files || files.length === 0) {
+      res.writeHead(502, { "Content-Type": "text/plain" });
+      res.end("Failed to fetch media");
+      return;
+    }
+
+    const slideUrls = files
+      .filter((f) => /\.(avif|webp|png|jpe?g|gif)$/i.test(f.name))
+      .sort((a, b) => {
+        const na = parseInt(a.name, 10);
+        const nb = parseInt(b.name, 10);
+        return !isNaN(na) && !isNaN(nb) ? na - nb : a.name.localeCompare(b.name);
+      })
+      .map((f) => supabase.storage.from(asset.bucket).getPublicUrl(`${folder}/${f.name}`).data.publicUrl);
+
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(renderSlideDeckViewer(slideUrls));
+    return;
+  }
+
   // storage_path is usually a path relative to the bucket, but some rows
   // have the full public URL written in by mistake — handle both
   const assetUrl = /^https?:\/\//i.test(asset.storage_path)
     ? asset.storage_path
     : supabase.storage.from(asset.bucket).getPublicUrl(asset.storage_path).data.publicUrl;
+
+  // video assets are HLS packages (a master.m3u8 manifest plus separate
+  // segment files), not a single playable file — chat clients can't render
+  // that inline, so hand back a page that plays it instead of the raw manifest
+  if (HLS_MIME_TYPES.has((asset.mime_type || "").toLowerCase())) {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(renderHlsPlayer(assetUrl));
+    return;
+  }
 
   const upstream = await fetch(assetUrl);
   if (!upstream.ok || !upstream.body) {
@@ -130,23 +265,28 @@ async function findAssetForPath(pathId, format) {
   // media_assets.asset_type stores the format, but under "deck" rather than "slide_deck"
   const assetType = format === "slide_deck" ? "deck" : format;
 
-  const { data: asset, error } = await supabase
+  // .limit(1) instead of .maybeSingle() — a handful of paths have more than
+  // one published row for the same asset_type, which .maybeSingle() treats
+  // as an error; take the most recent one instead of failing the lookup
+  const { data: assets, error } = await supabase
     .from("media_assets")
     .select("id, title, description")
     .eq("path_id", pathId)
     .eq("asset_type", assetType)
     .eq("is_published", true)
-    .maybeSingle();
+    .order("created_at", { ascending: false })
+    .limit(1);
 
   if (error) {
     console.error("Supabase media asset lookup failed:", error.message);
     return null;
   }
+  const asset = assets?.[0];
   if (!asset) return null;
 
   return {
     title: asset.title,
-    description: asset.description,
+    description: asset.description ?? "",
     url: `${PUBLIC_BASE_URL}/media/${asset.id}`
   };
 }
@@ -210,6 +350,10 @@ async function handleTopicRequest(ctx, topic) {
   }
 
   // visual
+  await sendFormatChoices(ctx, path);
+}
+
+async function sendFormatChoices(ctx, path) {
   await ctx.sendChoices(
     `Great choice! Here are the available formats for *${path.title}*. Which do you prefer?`,
     [
@@ -280,6 +424,25 @@ bot.onCommand("setstyle", async (ctx) => {
     `${blurb}\n\nWhat would you like to learn about?`,
     [{ label: "🎓 Find course content", value: "/findcourse" }]
   );
+});
+
+bot.onCommand("formats", async (ctx) => {
+  const topic = ctx.argText.trim();
+  if (!topic) {
+    await ctx.sendText("Sorry, I lost track of what you were looking for. Type /findcourse to start again.");
+    return;
+  }
+
+  const path = await findPathByTopic(topic);
+  if (!path) {
+    await ctx.sendText(
+      `😕 I couldn't find anything on *${topic}* right now.\n\n` +
+      `Try a different topic, or type /suggest for an idea.`
+    );
+    return;
+  }
+
+  await sendFormatChoices(ctx, path);
 });
 
 bot.onCommand("findcourse", async (ctx) => {
@@ -394,10 +557,10 @@ bot.onCommand("getformat", async (ctx) => {
       `📎 Access it here:\n${result.url}\n\n` +
       `What would you like to do next?`,
       [
-        { label: "🔄 Different format, same topic", value: `/findcourse` },
-        { label: "🎓 Find a new topic",              value: `/findcourse` },
-        { label: "🔀 Change learning style",         value: `/style`     },
-        { label: "🏠 Back to start",                 value: `/start`     }
+        { label: "🔄 Different format, same topic", value: `/formats ${topic}` },
+        { label: "🎓 Find a new topic",              value: `/findcourse`      },
+        { label: "🔀 Change learning style",         value: `/style`           },
+        { label: "🏠 Back to start",                 value: `/start`           }
       ]
     );
   } else {
