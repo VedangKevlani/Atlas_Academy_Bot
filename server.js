@@ -2,15 +2,63 @@ import "dotenv/config";
 import { createAtlasBot } from "atlas-bot-sdk";
 import { createClient } from "@supabase/supabase-js";
 import http from "node:http";
+import { Readable } from "node:stream";
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
 );
 
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
+
+// proxies media_assets storage objects under our own domain so the
+// Supabase project URL is never shown to or hit directly by the user
+async function serveMedia(req, res) {
+  const assetId = decodeURIComponent(req.url.slice("/media/".length).split("?")[0]);
+
+  const { data: asset, error } = await supabase
+    .from("media_assets")
+    .select("bucket, storage_path, mime_type")
+    .eq("id", assetId)
+    .eq("is_published", true)
+    .maybeSingle();
+
+  if (error || !asset) {
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("Not found");
+    return;
+  }
+
+  const { data: publicUrl } = supabase
+    .storage
+    .from(asset.bucket)
+    .getPublicUrl(asset.storage_path);
+
+  const upstream = await fetch(publicUrl.publicUrl);
+  if (!upstream.ok || !upstream.body) {
+    res.writeHead(502, { "Content-Type": "text/plain" });
+    res.end("Failed to fetch media");
+    return;
+  }
+
+  res.writeHead(200, {
+    "Content-Type": asset.mime_type || upstream.headers.get("content-type") || "application/octet-stream"
+  });
+  Readable.fromWeb(upstream.body).pipe(res);
+}
+
 const PORT = process.env.PORT || 3000;
 http
   .createServer((req, res) => {
+    if (req.url.startsWith("/media/")) {
+      serveMedia(req, res).catch((err) => {
+        console.error("Media proxy failed:", err.message);
+        res.writeHead(500, { "Content-Type": "text/plain" });
+        res.end("Internal error");
+      });
+      return;
+    }
+
     res.writeHead(200, { "Content-Type": "text/plain" });
     res.end("Intellibus Academy Bot is running.");
   })
@@ -52,7 +100,7 @@ async function findCourseContent({ topic, format }) {
 
   const { data: asset, error: assetError } = await supabase
     .from("media_assets")
-    .select("title, description, bucket, storage_path")
+    .select("id, title, description")
     .eq("path_id", path.id)
     .eq("asset_type", assetType)
     .eq("is_published", true)
@@ -67,18 +115,13 @@ async function findCourseContent({ topic, format }) {
     return { found: false, topic, format };
   }
 
-  const { data: publicUrl } = supabase
-    .storage
-    .from(asset.bucket)
-    .getPublicUrl(asset.storage_path);
-
   return {
     found: true,
     topic,
     format,
     title: asset.title,
     description: asset.description,
-    url: publicUrl.publicUrl
+    url: `${PUBLIC_BASE_URL}/media/${asset.id}`
   };
 }
 
@@ -183,20 +226,16 @@ bot.onCommand("getformat", async (ctx) => {
     return;
   }
 
-  await ctx.sendText(`🔍 Looking up the ${format.replace("_", " ")} for *${topic}*...`);
-
   const result = await findCourseContent({ topic, format });
 
   if (result.found) {
-    await ctx.sendText(
+    // result text and the next-step choices are combined into one send —
+    // two sends this close together would trip the SDK's 1s per-chat cooldown
+    await ctx.sendChoices(
       `✅ *${result.title}*\n\n` +
       `${result.description}\n\n` +
-      `📎 Access it here:\n${result.url}`
-    );
-
-    // this is an offer to find another format or topic
-    await ctx.sendChoices(
-      "What would you like to do next?",
+      `📎 Access it here:\n${result.url}\n\n` +
+      `What would you like to do next?`,
       [
         { label: "🔄 Different format, same topic", value: `/findcourse` },
         { label: "🎓 Find a new topic",              value: `/findcourse` },
