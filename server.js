@@ -251,8 +251,21 @@ function styleChoiceButtons() {
   ];
 }
 
+// tracks the last choice-prompt sent per room so it can be stripped of its
+// buttons once superseded — keeps old, no-longer-relevant buttons from
+// piling up in the scrollback where they could still be tapped by mistake
+const lastPrompt = new Map();
+
+async function sendChoicesTracked(ctx, text, choices) {
+  const prev = lastPrompt.get(ctx.roomId);
+  const result = await ctx.sendChoices(text, choices);
+  if (prev) await ctx.editMessage(prev.eventId, prev.text).catch(() => {});
+  if (result.sent && result.eventId) lastPrompt.set(ctx.roomId, { eventId: result.eventId, text });
+  return result;
+}
+
 async function promptLearningStyle(ctx, intro) {
-  await ctx.sendChoices(intro, styleChoiceButtons());
+  await sendChoicesTracked(ctx, intro, styleChoiceButtons());
 }
 
 // ---------- content lookup ----------
@@ -331,10 +344,17 @@ async function handleTopicRequest(ctx, topic) {
   }
 
   if (style === "kinesthetic") {
-    await ctx.sendText(
+    await sendChoicesTracked(
+      ctx,
       `🤸 *${path.title}* has hands-on flashcards and quizzes waiting for you on the Intellibus platform:\n\n` +
       `🔗 https://intellibus.academy/learning-paths/${path.slug}\n\n` +
-      `(You'll need to be logged into your Intellibus Academy account to access it.)`
+      `(You'll need to be logged into your Intellibus Academy account to access it.)\n\n` +
+      `What would you like to do next?`,
+      [
+        { label: "🎓 Find a new topic",      value: "/findcourse" },
+        { label: "🔀 Change learning style", value: "/style"      },
+        { label: "🏠 Back to start",         value: "/start"      }
+      ]
     );
     return;
   }
@@ -348,7 +368,8 @@ async function handleTopicRequest(ctx, topic) {
       );
       return;
     }
-    await ctx.sendChoices(
+    await sendChoicesTracked(
+      ctx,
       `✅ *${asset.title}*\n\n${asset.description}\n\n📎 Listen here:\n${asset.url}\n\n` +
       `What would you like to do next?`,
       [
@@ -365,7 +386,8 @@ async function handleTopicRequest(ctx, topic) {
 }
 
 async function sendFormatChoices(ctx, path) {
-  await ctx.sendChoices(
+  await sendChoicesTracked(
+    ctx,
     `Great choice! Here are the available formats for *${path.title}*. Which do you prefer?`,
     [
       { label: "🖼️  Infographic", value: `/getformat infographic ${path.topic}` },
@@ -400,7 +422,8 @@ bot.onCommand("start", async (ctx) => {
     return;
   }
 
-  await ctx.sendChoices(
+  await sendChoicesTracked(
+    ctx,
     `👋 Welcome back! You're set up for *${style}* learning. What would you like to do?`,
     [
       { label: "🎓 Find course content",   value: "/findcourse" },
@@ -431,7 +454,8 @@ bot.onCommand("setstyle", async (ctx) => {
     kinesthetic: "🤸 Got it — I'll point you to hands-on flashcards and quizzes on the Intellibus platform."
   }[style];
 
-  await ctx.sendChoices(
+  await sendChoicesTracked(
+    ctx,
     `${blurb}\n\nWhat would you like to learn about?`,
     [{ label: "🎓 Find course content", value: "/findcourse" }]
   );
@@ -562,7 +586,8 @@ bot.onCommand("getformat", async (ctx) => {
   if (result.found) {
     // result text and the next-step choices are combined into one send —
     // two sends this close together would trip the SDK's 1s per-chat cooldown
-    await ctx.sendChoices(
+    await sendChoicesTracked(
+      ctx,
       `✅ *${result.title}*\n\n` +
       `${result.description}\n\n` +
       `📎 Access it here:\n${result.url}\n\n` +
