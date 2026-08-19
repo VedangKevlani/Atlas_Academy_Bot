@@ -26,7 +26,61 @@ const bot = createAtlasBot({
   Never assume a format — always ask first.`
 });
 
-// this is the content lookup tool 
+// this is the content lookup tool
+
+async function findCourseContent({ topic, format }) {
+  // paths.topic groups content; media_assets.asset_type stores the format,
+  // but under "deck" rather than "slide_deck"
+  const assetType = format === "slide_deck" ? "deck" : format;
+
+  const { data: paths, error: pathError } = await supabase
+    .from("paths")
+    .select("id")
+    .ilike("topic", `%${topic}%`)
+    .eq("is_published", true)
+    .limit(1);
+
+  if (pathError) {
+    console.error("Supabase path lookup failed:", pathError.message);
+    return { found: false, topic, format };
+  }
+
+  const path = paths?.[0];
+  if (!path) {
+    return { found: false, topic, format };
+  }
+
+  const { data: asset, error: assetError } = await supabase
+    .from("media_assets")
+    .select("title, description, bucket, storage_path")
+    .eq("path_id", path.id)
+    .eq("asset_type", assetType)
+    .eq("is_published", true)
+    .maybeSingle();
+
+  if (assetError) {
+    console.error("Supabase media asset lookup failed:", assetError.message);
+    return { found: false, topic, format };
+  }
+
+  if (!asset) {
+    return { found: false, topic, format };
+  }
+
+  const { data: publicUrl } = supabase
+    .storage
+    .from(asset.bucket)
+    .getPublicUrl(asset.storage_path);
+
+  return {
+    found: true,
+    topic,
+    format,
+    title: asset.title,
+    description: asset.description,
+    url: publicUrl.publicUrl
+  };
+}
 
 bot.tools.register("find_course_content", {
   description: "Find a specific piece of course content by topic and format",
@@ -45,59 +99,7 @@ bot.tools.register("find_course_content", {
     },
     required: ["topic", "format"]
   },
-  handler: async ({ topic, format }) => {
-
-    // paths.topic groups content; media_assets.asset_type stores the format,
-    // but under "deck" rather than "slide_deck"
-    const assetType = format === "slide_deck" ? "deck" : format;
-
-    const { data: path, error: pathError } = await supabase
-      .from("paths")
-      .select("id")
-      .ilike("topic", topic)
-      .eq("is_published", true)
-      .maybeSingle();
-
-    if (pathError) {
-      console.error("Supabase path lookup failed:", pathError.message);
-      return { found: false, topic, format };
-    }
-
-    if (!path) {
-      return { found: false, topic, format };
-    }
-
-    const { data: asset, error: assetError } = await supabase
-      .from("media_assets")
-      .select("title, description, bucket, storage_path")
-      .eq("path_id", path.id)
-      .eq("asset_type", assetType)
-      .eq("is_published", true)
-      .maybeSingle();
-
-    if (assetError) {
-      console.error("Supabase media asset lookup failed:", assetError.message);
-      return { found: false, topic, format };
-    }
-
-    if (!asset) {
-      return { found: false, topic, format };
-    }
-
-    const { data: publicUrl } = supabase
-      .storage
-      .from(asset.bucket)
-      .getPublicUrl(asset.storage_path);
-
-    return {
-      found: true,
-      topic,
-      format,
-      title: asset.title,
-      description: asset.description,
-      url: publicUrl.publicUrl
-    };
-  }
+  handler: findCourseContent
 });
 
 // this is the /start command 
@@ -138,9 +140,9 @@ bot.onMessage(async (ctx) => {
 
   // after the LLM determines the topic, it offers format choices as buttons
   const turn = await ctx.think({
-    tools: {
+    tools: new Map([
       // this is an offer format picker as a tool the LLM can call mid-conversation
-      ask_format_preference: {
+      ["ask_format_preference", {
         description: "Ask the user to choose their preferred content format using buttons",
         parameters: {
           type: "object",
@@ -164,8 +166,8 @@ bot.onMessage(async (ctx) => {
           );
           return { offered: true, topic };
         }
-      }
-    }
+      }]
+    ])
   });
 
   if (turn.reply) await ctx.sendText(turn.reply);
@@ -183,8 +185,7 @@ bot.onCommand("getformat", async (ctx) => {
 
   await ctx.sendText(`🔍 Looking up the ${format.replace("_", " ")} for *${topic}*...`);
 
-  // Call the content lookup tool directly
-  const result = await bot.tools.call("find_course_content", { topic, format });
+  const result = await findCourseContent({ topic, format });
 
   if (result.found) {
     await ctx.sendText(
