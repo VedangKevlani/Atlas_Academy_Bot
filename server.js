@@ -77,10 +77,21 @@ function viewerChromeScript({ rotatable }) {
 }
 
 const VIEWER_CHROME_STYLE = `
-  #stage.rotated { transform: rotate(90deg); width: 100vh; height: 100vw; }
-  #controls { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 10px; background: #000; flex-wrap: wrap; }
+  #stage.rotated {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vh;
+    height: 100vw;
+    transform-origin: top left;
+    transform: rotate(90deg) translateY(-100%);
+    z-index: 1;
+  }
+  #controls { position: relative; z-index: 2; display: flex; flex-direction: column; gap: 8px; padding: 10px; background: #000; }
+  #controls .row { display: flex; align-items: center; justify-content: center; gap: 12px; flex-wrap: wrap; }
   #controls button, #controls a { background: #333; color: #eee; border: none; border-radius: 6px; padding: 8px 14px; font-size: 15px; cursor: pointer; text-decoration: none; display: inline-block; }
   #controls button:disabled { opacity: 0.4; cursor: default; }
+  #download { background: #2d7d46 !important; }
 `;
 
 function renderHlsPlayer(items) {
@@ -104,11 +115,15 @@ function renderHlsPlayer(items) {
 <div id="stage"><video id="player" controls autoplay playsinline></video></div>
 <div id="title"></div>
 <div id="controls">
-  <button id="prev">‹ Prev</button>
-  <span id="counter"></span>
-  <button id="next">Next ›</button>
-  <button id="rotate">⟳ Rotate</button>
-  <button id="fullscreen">⛶ Fullscreen</button>
+  <div class="row">
+    <button id="prev">‹ Prev</button>
+    <span id="counter"></span>
+    <button id="next">Next ›</button>
+  </div>
+  <div class="row">
+    <button id="rotate">⟳ Rotate</button>
+    <button id="fullscreen">⛶ Fullscreen</button>
+  </div>
 </div>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
 <script>
@@ -170,14 +185,18 @@ function renderInfographicViewer(items) {
 <div id="stage"><img id="pic" alt="Infographic"></div>
 <div id="title"></div>
 <div id="controls">
-  <button id="prev">‹ Prev</button>
-  <span id="counter"></span>
-  <button id="next">Next ›</button>
-  <button id="zoomOut">− Zoom</button>
-  <button id="zoomIn">+ Zoom</button>
-  <button id="rotate">⟳ Rotate</button>
-  <button id="fullscreen">⛶ Fullscreen</button>
-  <a id="download" class="btn">⬇️ Download</a>
+  <div class="row">
+    <button id="prev">‹ Prev</button>
+    <span id="counter"></span>
+    <button id="next">Next ›</button>
+  </div>
+  <div class="row">
+    <button id="zoomOut">− Zoom</button>
+    <button id="zoomIn">+ Zoom</button>
+    <button id="rotate">⟳ Rotate</button>
+    <button id="fullscreen">⛶ Fullscreen</button>
+    <a id="download" target="_blank" rel="noopener">⬇️ Download</a>
+  </div>
 </div>
 <script>
   const items = ${itemsJson};
@@ -237,10 +256,14 @@ function renderAudioPlayer(items) {
 <div id="stage"><audio id="player" controls autoplay></audio></div>
 <div id="title"></div>
 <div id="controls">
-  <button id="prev">‹ Prev</button>
-  <span id="counter"></span>
-  <button id="next">Next ›</button>
-  <a id="download" class="btn">⬇️ Download</a>
+  <div class="row">
+    <button id="prev">‹ Prev</button>
+    <span id="counter"></span>
+    <button id="next">Next ›</button>
+  </div>
+  <div class="row">
+    <a id="download" target="_blank" rel="noopener">⬇️ Download</a>
+  </div>
 </div>
 <script>
   const items = ${itemsJson};
@@ -325,11 +348,15 @@ function renderSlideDeckViewer(slides) {
 <body>
 <div id="stage"><img id="slide" alt="Slide"></div>
 <div id="controls">
-  <button id="prev">‹ Prev</button>
-  <span id="counter"></span>
-  <button id="next">Next ›</button>
-  <button id="fullscreen">⛶ Fullscreen</button>
-  <a id="download" class="btn">⬇️ Download slide</a>
+  <div class="row">
+    <button id="prev">‹ Prev</button>
+    <span id="counter"></span>
+    <button id="next">Next ›</button>
+  </div>
+  <div class="row">
+    <button id="fullscreen">⛶ Fullscreen</button>
+    <a id="download" target="_blank" rel="noopener">⬇️ Download slide</a>
+  </div>
 </div>
 <script>
   const slides = ${slidesJson};
@@ -659,9 +686,13 @@ async function setUserStyle(userId, style) {
 }
 
 async function setPreferredFormat(userId, format) {
+  // learning_style is NOT NULL — Postgres validates that constraint against
+  // the upsert's hypothetical INSERT row before it ever gets to resolving
+  // the ON CONFLICT update, so omitting it here fails silently on every call
+  const { style } = await getUserPreferences(userId);
   const { error } = await supabase
     .from("user_preferences")
-    .upsert({ user_id: userId, preferred_format: format }, { onConflict: "user_id" });
+    .upsert({ user_id: userId, learning_style: style, preferred_format: format }, { onConflict: "user_id" });
 
   if (error) console.error("Supabase preferred_format upsert failed:", error.message);
 }
@@ -1058,9 +1089,49 @@ const bot = createAtlasBot({
   by their stored learning style and past choices, not by you.`
 });
 
+// messages for a given room are dispatched strictly in order — if a handler
+// ever hangs (e.g. a network call with no timeout of its own), every later
+// message in that same room would silently queue up behind it forever, with
+// no error and no reply, until the process restarts. This wraps every
+// handler so a stuck call can't do that: past the timeout it gives up,
+// apologizes, and lets the queue move on. onMessage gets a longer budget
+// since ctx.think() legitimately can take up to ~2 minutes on its own.
+const DEFAULT_HANDLER_TIMEOUT_MS = 20000;
+
+function withTimeout(handler, ms = DEFAULT_HANDLER_TIMEOUT_MS) {
+  return async (ctx) => {
+    let timedOut = false;
+    const timer = new Promise((resolve) => {
+      const t = setTimeout(() => { timedOut = true; resolve(); }, ms);
+      t.unref?.();
+    });
+
+    try {
+      await Promise.race([handler(ctx), timer]);
+    } catch (err) {
+      console.error(`handler error: ${err.message}`);
+      await ctx.sendText("😕 Something went wrong on my end — try that again in a moment.").catch(() => {});
+      return;
+    }
+
+    if (timedOut) {
+      console.error(`handler timed out after ${ms}ms`);
+      await ctx.sendText("😕 That took too long to respond — try again in a moment.").catch(() => {});
+    }
+  };
+}
+
+function onCommand(name, handler) {
+  bot.onCommand(name, withTimeout(handler));
+}
+
+function onMessage(handler, ms) {
+  bot.onMessage(withTimeout(handler, ms));
+}
+
 // ---------- commands ----------
 
-bot.onCommand("start", async (ctx) => {
+onCommand("start", async (ctx) => {
   const { style } = await getUserPreferences(ctx.sender);
 
   if (!style) {
@@ -1084,11 +1155,11 @@ bot.onCommand("start", async (ctx) => {
   );
 });
 
-bot.onCommand("style", async (ctx) => {
+onCommand("style", async (ctx) => {
   await promptLearningStyle(ctx, "How do you learn best?");
 });
 
-bot.onCommand("setstyle", async (ctx) => {
+onCommand("setstyle", async (ctx) => {
   const style = ctx.args[0];
 
   if (!LEARNING_STYLES.includes(style)) {
@@ -1111,7 +1182,7 @@ bot.onCommand("setstyle", async (ctx) => {
   );
 });
 
-bot.onCommand("formats", async (ctx) => {
+onCommand("formats", async (ctx) => {
   const slug = ctx.argText.trim();
   const path = await findPathBySlug(slug);
   if (!path) {
@@ -1121,7 +1192,7 @@ bot.onCommand("formats", async (ctx) => {
   await sendFormatChoices(ctx, path);
 });
 
-bot.onCommand("openpath", async (ctx) => {
+onCommand("openpath", async (ctx) => {
   const slug = ctx.argText.trim();
   const { style, preferredFormat } = await getUserPreferences(ctx.sender);
   if (!style) {
@@ -1136,7 +1207,7 @@ bot.onCommand("openpath", async (ctx) => {
   await deliverForStyle(ctx, style, preferredFormat, path);
 });
 
-bot.onCommand("playlist", async (ctx) => {
+onCommand("playlist", async (ctx) => {
   const slugs = ctx.argText.trim().split(",").map((s) => s.trim()).filter(Boolean);
   if (slugs.length === 0) {
     await ctx.sendText("Sorry, I lost track of what you were looking for. Type /findcourse to start again.");
@@ -1145,7 +1216,7 @@ bot.onCommand("playlist", async (ctx) => {
   await deliverPlaylist(ctx, slugs);
 });
 
-bot.onCommand("playlistformat", async (ctx) => {
+onCommand("playlistformat", async (ctx) => {
   const [format, slugArg] = ctx.args;
   const slugs = (slugArg ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 
@@ -1170,7 +1241,7 @@ bot.onCommand("playlistformat", async (ctx) => {
   await deliverPlaylistFormat(ctx, paths, format);
 });
 
-bot.onCommand("role", async (ctx) => {
+onCommand("role", async (ctx) => {
   const roleInput = ctx.argText.trim();
 
   if (!roleInput) {
@@ -1185,7 +1256,7 @@ bot.onCommand("role", async (ctx) => {
   await handleRoleRequest(ctx, roleInput);
 });
 
-bot.onCommand("findcourse", async (ctx) => {
+onCommand("findcourse", async (ctx) => {
   const { style } = await getUserPreferences(ctx.sender);
   if (!style) {
     await promptLearningStyle(ctx, "Let's set your learning style first — how do you learn best?");
@@ -1198,7 +1269,7 @@ bot.onCommand("findcourse", async (ctx) => {
   );
 });
 
-bot.onCommand("suggest", async (ctx) => {
+onCommand("suggest", async (ctx) => {
   const { data: paths, error } = await supabase
     .from("paths")
     .select("id, slug, topic, title")
@@ -1214,7 +1285,7 @@ bot.onCommand("suggest", async (ctx) => {
   await presentPaths(ctx, [pick], pick.topic);
 });
 
-bot.onCommand("remind", async (ctx) => {
+onCommand("remind", async (ctx) => {
   const topic = ctx.argText.trim();
 
   if (!topic) {
@@ -1232,7 +1303,7 @@ bot.onCommand("remind", async (ctx) => {
   await ctx.sendText(`⏰ Done! I'll remind you tomorrow to keep learning *${topic}*.`);
 });
 
-bot.onCommand("help", async (ctx) => {
+onCommand("help", async (ctx) => {
   await ctx.sendText(
     "Here's what I can do:\n\n" +
     "🔹 /findcourse — find training content on any topic\n" +
@@ -1245,7 +1316,7 @@ bot.onCommand("help", async (ctx) => {
 });
 
 // all other messages - handled by the platform LLM
-bot.onMessage(async (ctx) => {
+onMessage(async (ctx) => {
   const { style } = await getUserPreferences(ctx.sender);
   if (!style) {
     await promptLearningStyle(ctx, "Let's set your learning style first — how do you learn best?");
@@ -1299,10 +1370,10 @@ bot.onMessage(async (ctx) => {
   });
 
   if (!repliedDirectly && turn.reply) await ctx.sendText(turn.reply);
-});
+}, 150000); // headroom above ctx.think()'s own ~120s internal timeout
 
 // this is the /getformat command - it fires when a visual-style user taps a format button
-bot.onCommand("getformat", async (ctx) => {
+onCommand("getformat", async (ctx) => {
   const [format, slug] = ctx.args;
 
   if (!format || !slug) {
