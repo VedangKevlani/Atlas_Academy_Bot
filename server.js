@@ -706,16 +706,15 @@ function styleChoiceButtons() {
 }
 
 // tracks the last choice-prompt sent per room so it can be stripped of its
-// buttons once superseded — keeps old, no-longer-relevant buttons from
-// piling up in the scrollback where they could still be tapped by mistake
-const lastPrompt = new Map();
-
+// NOTE: this used to also edit the previous choice-prompt to strip its
+// buttons (decluttering old, no-longer-relevant buttons from scrollback).
+// Reverted — that meant calling ctx.editMessage() on nearly every reply, and
+// if the client doesn't correctly handle m.replace edit relations, it would
+// render each edit as a brand-new message instead of updating in place,
+// which looks exactly like the "duplicate messages" bug being reported.
+// Suspected but not confirmed — kept simple until that's ruled out.
 async function sendChoicesTracked(ctx, text, choices) {
-  const prev = lastPrompt.get(ctx.roomId);
-  const result = await ctx.sendChoices(text, choices);
-  if (prev) await ctx.editMessage(prev.eventId, prev.text).catch(() => {});
-  if (result.sent && result.eventId) lastPrompt.set(ctx.roomId, { eventId: result.eventId, text });
-  return result;
+  return ctx.sendChoices(text, choices);
 }
 
 async function promptLearningStyle(ctx, intro) {
@@ -921,7 +920,7 @@ async function deliverForStyle(ctx, style, preferredFormat, path) {
 // random one — each button pins the exact course via its slug
 async function sendDisambiguationPicker(ctx, paths, label) {
   const rows = paths.map((path) => [{ label: path.title, value: `/openpath ${path.slug}` }]);
-  rows.push([{ label: "▶️ Play all as a playlist", value: `/playlist ${paths.map((p) => p.slug).join(",")}` }]);
+  rows.push([{ label: "▶️ Play all as a playlist", value: `/playlist ${label}::${paths.map((p) => p.slug).join(",")}` }]);
 
   await sendChoicesTracked(
     ctx,
@@ -975,7 +974,18 @@ async function handleRoleRequest(ctx, roleInput) {
 
 // ---------- playlists ----------
 
-async function deliverPlaylist(ctx, slugs) {
+// button values for playlists carry an optional "label::slug,slug,..." shape
+// so the delivered playlist message can show what it's actually a playlist
+// of, instead of just a course count
+function parseLabelAndSlugs(raw) {
+  const sepIdx = raw.indexOf("::");
+  const label = sepIdx >= 0 ? raw.slice(0, sepIdx) : null;
+  const slugsPart = sepIdx >= 0 ? raw.slice(sepIdx + 2) : raw;
+  const slugs = slugsPart.split(",").map((s) => s.trim()).filter(Boolean);
+  return { label, slugs };
+}
+
+async function deliverPlaylist(ctx, slugs, label) {
   const { style, preferredFormat } = await getUserPreferences(ctx.sender);
   if (!style) {
     await promptLearningStyle(ctx, "Let's set your learning style first — how do you learn best?");
@@ -994,41 +1004,43 @@ async function deliverPlaylist(ctx, slugs) {
   }
   const bySlug = new Map(matched.map((p) => [p.slug, p]));
   const paths = slugs.map((s) => bySlug.get(s)).filter(Boolean);
+  const titleLine = label ? `🎵 *${label} playlist*\n\n` : "";
 
   if (style === "kinesthetic") {
     const lines = paths.map((p) => `🤸 *${p.title}*\n🔗 https://intellibus.academy/learning-paths/${p.slug}`);
     await sendChoicesTracked(
       ctx,
-      `Here's the full list — you'll need to be logged into your Intellibus Academy account:\n\n${lines.join("\n\n")}\n\nWhat would you like to do next?`,
+      `${titleLine}Here's the full list — you'll need to be logged into your Intellibus Academy account:\n\n${lines.join("\n\n")}\n\nWhat would you like to do next?`,
       followUpButtons()
     );
     return;
   }
 
   if (style === "audio") {
-    await deliverPlaylistFormat(ctx, paths, "audio");
+    await deliverPlaylistFormat(ctx, paths, "audio", label);
     return;
   }
 
   // visual
   if (preferredFormat && preferredFormat !== "slide_deck") {
-    await deliverPlaylistFormat(ctx, paths, preferredFormat);
+    await deliverPlaylistFormat(ctx, paths, preferredFormat, label);
     return;
   }
 
   // no usable stored format yet (or it's slide_deck, which isn't
   // playlist-able — decks need their own per-slide navigation) — ask once
+  const labelPart = label ? `${label}::` : "";
   await sendChoicesTracked(
     ctx,
-    `Which format would you like this playlist in?`,
+    `${titleLine}Which format would you like this playlist in?`,
     [
-      { label: "🖼️  Infographic", value: `/playlistformat infographic ${slugs.join(",")}` },
-      { label: "🎬  Video",        value: `/playlistformat video ${slugs.join(",")}`       }
+      { label: "🖼️  Infographic", value: `/playlistformat infographic ${labelPart}${slugs.join(",")}` },
+      { label: "🎬  Video",        value: `/playlistformat video ${labelPart}${slugs.join(",")}`       }
     ]
   );
 }
 
-async function deliverPlaylistFormat(ctx, paths, format) {
+async function deliverPlaylistFormat(ctx, paths, format, label) {
   if (format === "slide_deck") {
     // decks aren't playlist-able yet (nested slide navigation) — just hand
     // back the first course's deck and point at the picker for the rest
@@ -1057,7 +1069,8 @@ async function deliverPlaylistFormat(ctx, paths, format) {
   // order as the resolved paths
   const byPath = new Map();
   for (const row of rows ?? []) if (!byPath.has(row.path_id)) byPath.set(row.path_id, row);
-  const assetIds = paths.map((p) => byPath.get(p.id)?.id).filter(Boolean);
+  const includedPaths = paths.filter((p) => byPath.has(p.id));
+  const assetIds = includedPaths.map((p) => byPath.get(p.id).id);
 
   if (assetIds.length === 0) {
     await ctx.sendText(`😕 I couldn't find any ${format.replace("_", " ")} content for that set of courses yet.`);
@@ -1066,9 +1079,14 @@ async function deliverPlaylistFormat(ctx, paths, format) {
 
   await setPreferredFormat(ctx.sender, format);
 
+  const titleLine = label
+    ? `🎵 *${label} playlist* — ${format.replace("_", " ")} (${assetIds.length} course${assetIds.length === 1 ? "" : "s"})\n\n`
+    : `✅ Playlist ready — *${assetIds.length}* course${assetIds.length === 1 ? "" : "s"} queued up.\n\n`;
+  const courseList = includedPaths.map((p, idx) => `${idx + 1}. ${p.title}`).join("\n");
+
   await sendChoicesTracked(
     ctx,
-    `✅ Playlist ready — *${assetIds.length}* course${assetIds.length === 1 ? "" : "s"} queued up.\n\n` +
+    `${titleLine}${courseList}\n\n` +
     `📎 Start here:\n${PUBLIC_BASE_URL}/playlist/${assetIds.join(",")}\n\n` +
     `What would you like to do next?`,
     followUpButtons()
@@ -1208,17 +1226,19 @@ onCommand("openpath", async (ctx) => {
 });
 
 onCommand("playlist", async (ctx) => {
-  const slugs = ctx.argText.trim().split(",").map((s) => s.trim()).filter(Boolean);
+  const { label, slugs } = parseLabelAndSlugs(ctx.argText.trim());
   if (slugs.length === 0) {
     await ctx.sendText("Sorry, I lost track of what you were looking for. Type /findcourse to start again.");
     return;
   }
-  await deliverPlaylist(ctx, slugs);
+  await deliverPlaylist(ctx, slugs, label);
 });
 
 onCommand("playlistformat", async (ctx) => {
-  const [format, slugArg] = ctx.args;
-  const slugs = (slugArg ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  const raw = ctx.argText.trim();
+  const spaceIdx = raw.indexOf(" ");
+  const format = spaceIdx >= 0 ? raw.slice(0, spaceIdx) : raw;
+  const { label, slugs } = parseLabelAndSlugs(spaceIdx >= 0 ? raw.slice(spaceIdx + 1) : "");
 
   if (!VISUAL_FORMATS.includes(format) || slugs.length === 0) {
     await ctx.sendText("Sorry, I lost track of what you were looking for. Type /findcourse to start again.");
@@ -1238,7 +1258,7 @@ onCommand("playlistformat", async (ctx) => {
     return;
   }
 
-  await deliverPlaylistFormat(ctx, paths, format);
+  await deliverPlaylistFormat(ctx, paths, format, label);
 });
 
 onCommand("role", async (ctx) => {
@@ -1285,22 +1305,76 @@ onCommand("suggest", async (ctx) => {
   await presentPaths(ctx, [pick], pick.topic);
 });
 
-onCommand("remind", async (ctx) => {
-  const topic = ctx.argText.trim();
+const REMIND_DURATION_RE = /^(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$/i;
 
-  if (!topic) {
-    await ctx.sendText("Tell me what you'd like a reminder for, e.g. `/remind CSS`");
+function parseDurationMs(text) {
+  const match = text.trim().match(REMIND_DURATION_RE);
+  if (!match) return null;
+  const amount = parseInt(match[1], 10);
+  const unit = match[2].toLowerCase();
+  const msPerUnit = unit.startsWith("m") ? 60000 : unit.startsWith("h") ? 3600000 : 86400000;
+  return amount * msPerUnit;
+}
+
+function describeDelay(ms) {
+  const minutes = Math.round(ms / 60000);
+  if (minutes < 60) return `in ${minutes} minute${minutes === 1 ? "" : "s"}`;
+  const hours = Math.round(ms / 3600000);
+  if (hours < 24) return `in ${hours} hour${hours === 1 ? "" : "s"}`;
+  const days = Math.round(ms / 86400000);
+  return days === 1 ? "tomorrow" : `in ${days} days`;
+}
+
+onCommand("remind", async (ctx) => {
+  const raw = ctx.argText.trim();
+
+  if (raw.toLowerCase() === "cancel") {
+    await supabase.from("reminders").delete().eq("user_id", ctx.sender).eq("sent", false);
+    await ctx.sendText("🔕 Cancelled your reminder.");
     return;
   }
 
-  const remindAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
-  await ctx.scheduleNotification({
-    title: "Keep learning! 📚",
-    body: `Time to continue with ${topic} on Intellibus Academy.`,
-    date: remindAt
+  const inMatch = raw.match(/^(.*)\s+in\s+([\d\s\w]+)$/i);
+  const delayMs = inMatch ? parseDurationMs(inMatch[2]) : null;
+  const topic = inMatch && delayMs ? inMatch[1].trim() : raw;
+
+  if (!topic) {
+    await ctx.sendText(
+      "Tell me what you'd like a reminder for, and optionally when:\n\n" +
+      "`/remind CSS` — tomorrow\n" +
+      "`/remind CSS in 30m` — in 30 minutes\n" +
+      "`/remind CSS in 2h` — in 2 hours\n" +
+      "`/remind cancel` — cancel your reminder\n\n" +
+      "Run /remind again anytime to change the topic or time — it replaces your last one."
+    );
+    return;
+  }
+
+  if (inMatch && !delayMs) {
+    await ctx.sendText(`😕 I didn't understand that time. Try something like \`/remind ${inMatch[1].trim()} in 30m\` or \`in 2h\`.`);
+    return;
+  }
+
+  const delay = delayMs ?? 24 * 60 * 60 * 1000;
+  const remindAt = new Date(Date.now() + delay);
+
+  // one active reminder per user — clear any existing unsent one first so
+  // re-running /remind changes the time/topic instead of stacking
+  await supabase.from("reminders").delete().eq("user_id", ctx.sender).eq("sent", false);
+  const { error } = await supabase.from("reminders").insert({
+    user_id: ctx.sender,
+    room_id: ctx.roomId,
+    topic,
+    remind_at: remindAt.toISOString()
   });
 
-  await ctx.sendText(`⏰ Done! I'll remind you tomorrow to keep learning *${topic}*.`);
+  if (error) {
+    console.error("Supabase reminder insert failed:", error.message);
+    await ctx.sendText("😕 Something went wrong scheduling that — try again in a moment.");
+    return;
+  }
+
+  await ctx.sendText(`⏰ Done! I'll remind you ${describeDelay(delay)} to keep learning *${topic}*.`);
 });
 
 onCommand("help", async (ctx) => {
@@ -1310,7 +1384,7 @@ onCommand("help", async (ctx) => {
     "🔹 /role — get course recommendations for a job role\n" +
     "🔹 /style — change how content is delivered to you (audio, visual, or kinesthetic)\n" +
     "🔹 /suggest — get a topic recommendation\n" +
-    "🔹 /remind <topic> — get reminded tomorrow to keep learning\n\n" +
+    "🔹 /remind <topic> [in <time>] — get reminded to keep learning (defaults to tomorrow; try `in 30m` or `in 2h`; running it again changes the time)\n\n" +
     "Just tell me what you want to learn and I'll take it from there, tailored to how you learn best."
   );
 });
@@ -1389,6 +1463,62 @@ onCommand("getformat", async (ctx) => {
 
   await deliverFormat(ctx, path, format);
 });
+
+// ---------- reminder delivery ----------
+// self-contained: polls the reminders table and sends due ones directly via
+// bot.sendText, which already goes through the same notify() pipeline every
+// other reply uses to trigger a push notification — no external scheduler
+// service required
+const REMINDER_POLL_INTERVAL_MS = 30000;
+let reminderPollInFlight = false;
+
+async function checkDueReminders() {
+  if (reminderPollInFlight) return;
+  reminderPollInFlight = true;
+
+  try {
+    const { data: due, error } = await supabase
+      .from("reminders")
+      .select("id, user_id, room_id, topic")
+      .eq("sent", false)
+      .lte("remind_at", new Date().toISOString())
+      .limit(50);
+
+    if (error) {
+      console.error("Supabase reminder poll failed:", error.message);
+      return;
+    }
+
+    for (const reminder of due ?? []) {
+      // claim it first (only if still unsent) so a slow send or an
+      // overlapping tick can never deliver the same reminder twice
+      const { data: claimed, error: claimError } = await supabase
+        .from("reminders")
+        .update({ sent: true })
+        .eq("id", reminder.id)
+        .eq("sent", false)
+        .select("id");
+
+      if (claimError) {
+        console.error(`Failed to claim reminder ${reminder.id}:`, claimError.message);
+        continue;
+      }
+      if (!claimed || claimed.length === 0) continue; // already claimed elsewhere
+
+      try {
+        await bot.sendText(reminder.room_id, `⏰ *Reminder:* time to continue with *${reminder.topic}* on Intellibus Academy!`);
+      } catch (err) {
+        console.error(`Failed to deliver reminder ${reminder.id}:`, err.message);
+      }
+    }
+  } finally {
+    reminderPollInFlight = false;
+  }
+}
+
+setInterval(() => {
+  checkDueReminders().catch((err) => console.error("Reminder poll error:", err.message));
+}, REMINDER_POLL_INTERVAL_MS);
 
 bot.start();
 console.log("Intellibus Academy Bot is running...");
