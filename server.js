@@ -69,9 +69,16 @@ function viewerChromeScript({ rotatable }) {
   ${rotatable ? `
   let rotated = false;
   const rotateBtn = document.getElementById("rotate");
+  const controlsEl = document.getElementById("controls");
   rotateBtn.addEventListener("click", () => {
     rotated = !rotated;
     stageEl.classList.toggle("rotated", rotated);
+    // controls take up space / overlay the rotated fullscreen content — hide
+    // them once rotated, tap the stage to bring them back to un-rotate
+    controlsEl.classList.toggle("hidden", rotated);
+  });
+  stageEl.addEventListener("click", () => {
+    if (rotated) controlsEl.classList.toggle("hidden");
   });` : ""}
   `;
 }
@@ -88,10 +95,21 @@ const VIEWER_CHROME_STYLE = `
     z-index: 1;
   }
   #controls { position: relative; z-index: 2; display: flex; flex-direction: column; gap: 8px; padding: 10px; background: #000; }
+  #controls.hidden { display: none; }
   #controls .row { display: flex; align-items: center; justify-content: center; gap: 12px; flex-wrap: wrap; }
-  #controls button, #controls a { background: #333; color: #eee; border: none; border-radius: 6px; padding: 8px 14px; font-size: 15px; cursor: pointer; text-decoration: none; display: inline-block; }
+  #controls button, #controls a.tool { background: #333; color: #eee; border: none; border-radius: 6px; padding: 8px 14px; font-size: 15px; cursor: pointer; text-decoration: none; display: inline-block; }
   #controls button:disabled { opacity: 0.4; cursor: default; }
-  #download { background: #2d7d46 !important; }
+  #download {
+    display: block;
+    background: #2d7d46;
+    color: #fff;
+    text-align: center;
+    padding: 14px;
+    font-size: 17px;
+    font-weight: 600;
+    border-radius: 8px;
+    text-decoration: none;
+  }
 `;
 
 function renderHlsPlayer(items) {
@@ -106,7 +124,7 @@ function renderHlsPlayer(items) {
   html, body { margin: 0; height: 100%; background: #000; }
   body { display: flex; flex-direction: column; }
   #stage { flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; transition: transform 0.2s; }
-  #stage video { width: 100%; height: 100%; }
+  #stage video { width: 100%; height: 100%; object-fit: contain; }
   ${VIEWER_CHROME_STYLE}
   #title { color: #eee; font-family: system-ui, sans-serif; text-align: center; padding: 6px; font-size: 14px; }
 </style>
@@ -195,8 +213,8 @@ function renderInfographicViewer(items) {
     <button id="zoomIn">+ Zoom</button>
     <button id="rotate">⟳ Rotate</button>
     <button id="fullscreen">⛶ Fullscreen</button>
-    <a id="download" target="_blank" rel="noopener">⬇️ Download</a>
   </div>
+  <a id="download" target="_blank" rel="noopener">⬇️ Download to Device</a>
 </div>
 <script>
   const items = ${itemsJson};
@@ -261,9 +279,7 @@ function renderAudioPlayer(items) {
     <span id="counter"></span>
     <button id="next">Next ›</button>
   </div>
-  <div class="row">
-    <a id="download" target="_blank" rel="noopener">⬇️ Download</a>
-  </div>
+  <a id="download" target="_blank" rel="noopener">⬇️ Download to Device</a>
 </div>
 <script>
   const items = ${itemsJson};
@@ -355,8 +371,8 @@ function renderSlideDeckViewer(slides) {
   </div>
   <div class="row">
     <button id="fullscreen">⛶ Fullscreen</button>
-    <a id="download" target="_blank" rel="noopener">⬇️ Download slide</a>
   </div>
+  <a id="download" target="_blank" rel="noopener">⬇️ Download This Slide</a>
 </div>
 <script>
   const slides = ${slidesJson};
@@ -847,7 +863,7 @@ async function deliverFormat(ctx, path, format) {
     return;
   }
 
-  await setPreferredFormat(ctx.sender, format);
+  if (VISUAL_FORMATS.includes(format)) await setPreferredFormat(ctx.sender, format);
 
   await sendChoicesTracked(
     ctx,
@@ -1077,7 +1093,11 @@ async function deliverPlaylistFormat(ctx, paths, format, label) {
     return;
   }
 
-  await setPreferredFormat(ctx.sender, format);
+  // preferred_format only ever means "visual sub-format" (its check
+  // constraint only allows infographic/video/slide_deck) — this function is
+  // also used for the audio-style playlist path, which must not try to save
+  // "audio" here or the upsert violates that constraint
+  if (VISUAL_FORMATS.includes(format)) await setPreferredFormat(ctx.sender, format);
 
   const titleLine = label
     ? `🎵 *${label} playlist* — ${format.replace("_", " ")} (${assetIds.length} course${assetIds.length === 1 ? "" : "s"})\n\n`
@@ -1358,15 +1378,18 @@ onCommand("remind", async (ctx) => {
   const delay = delayMs ?? 24 * 60 * 60 * 1000;
   const remindAt = new Date(Date.now() + delay);
 
-  // one active reminder per user — clear any existing unsent one first so
-  // re-running /remind changes the time/topic instead of stacking
-  await supabase.from("reminders").delete().eq("user_id", ctx.sender).eq("sent", false);
-  const { error } = await supabase.from("reminders").insert({
+  // one active reminder per user, enforced by a unique constraint on user_id
+  // — upsert so re-running /remind atomically replaces the time/topic
+  // instead of racing a separate delete+insert (which could leave two rows
+  // if /remind was invoked twice in quick succession, each later firing its
+  // own reminder — that looks exactly like a duplicated reminder message)
+  const { error } = await supabase.from("reminders").upsert({
     user_id: ctx.sender,
     room_id: ctx.roomId,
     topic,
-    remind_at: remindAt.toISOString()
-  });
+    remind_at: remindAt.toISOString(),
+    sent: false
+  }, { onConflict: "user_id" });
 
   if (error) {
     console.error("Supabase reminder insert failed:", error.message);
@@ -1510,6 +1533,10 @@ async function checkDueReminders() {
       } catch (err) {
         console.error(`Failed to deliver reminder ${reminder.id}:`, err.message);
       }
+
+      // clean up rather than leaving sent:true rows around — also means the
+      // unique user_id constraint doesn't block their next /remind
+      await supabase.from("reminders").delete().eq("id", reminder.id);
     }
   } finally {
     reminderPollInFlight = false;
