@@ -343,6 +343,46 @@ function sanitizeFilename(title) {
   return title.replace(/[^a-zA-Z0-9 _-]/g, "").trim().replace(/\s+/g, "-").slice(0, 80) || "download";
 }
 
+// downloads a whole file into memory and uploads it as a native chat
+// attachment, so it saves via the chat client's own attachment-save UI
+// instead of depending on a web page's download link working inside
+// whatever webview opened it. Only works for genuinely single-file assets —
+// video (HLS, no single file) and folder-based decks (many slide images)
+// aren't sendable this way; callers should check for those first.
+// audio in this catalog runs up to ~100MB, and the whole file has to be
+// buffered in memory before it can be uploaded (the SDK's send methods take
+// raw bytes, not a stream) — cap it well under typical homeserver upload
+// limits so an oversized file fails fast with a clear message instead of
+// burning memory on a buffer that was going to be rejected anyway
+const MAX_ATTACHMENT_BYTES = 60 * 1024 * 1024;
+
+async function sendAssetAsAttachment(ctx, asset) {
+  const assetUrl = resolveAssetUrl(asset);
+  const upstream = await fetch(assetUrl);
+  if (!upstream.ok || !upstream.body) return { sent: false, reason: "fetch_failed" };
+
+  const contentLength = parseInt(upstream.headers.get("content-length") || "0", 10);
+  if (contentLength > MAX_ATTACHMENT_BYTES) {
+    await upstream.body.cancel().catch(() => {});
+    return { sent: false, reason: "too_large" };
+  }
+
+  const bytes = new Uint8Array(await upstream.arrayBuffer());
+  const mimetype = asset.mime_type || upstream.headers.get("content-type") || "application/octet-stream";
+  const filename = `${sanitizeFilename(asset.title)}.${extensionFromUrl(assetUrl, mimetype)}`;
+
+  if (asset.asset_type === "audio") {
+    await ctx.sendVoice(bytes, { filename, mimetype });
+  } else if (asset.asset_type === "infographic") {
+    await ctx.sendImage(bytes, { filename, mimetype });
+  } else if (asset.asset_type === "deck") {
+    await ctx.sendDocument(bytes, { filename, mimetype });
+  } else {
+    return { sent: false, reason: "unsupported_type" };
+  }
+  return { sent: true };
+}
+
 // slides: [{ src, download }]
 function renderSlideDeckViewer(slides) {
   const slidesJson = JSON.stringify(slides).replace(/</g, "\\u003c");
@@ -845,6 +885,7 @@ async function findAssetForPath(pathId, format) {
   if (!asset) return null;
 
   return {
+    id: asset.id,
     title: asset.title,
     description: asset.description ?? "",
     url: `${PUBLIC_BASE_URL}/media/${asset.id}`
@@ -865,16 +906,17 @@ async function deliverFormat(ctx, path, format) {
 
   if (VISUAL_FORMATS.includes(format)) await setPreferredFormat(ctx.sender, format);
 
+  const buttons = [{ label: "🔄 Different format, same topic", value: `/formats ${path.slug}` }];
+  if (format !== "video") buttons.push({ label: "⬇️ Save to device", value: `/downloadasset ${asset.id}` });
+  buttons.push(...followUpButtons());
+
   await sendChoicesTracked(
     ctx,
     `✅ *${asset.title}*\n\n` +
     `${asset.description}\n\n` +
     `📎 Access it here:\n${asset.url}\n\n` +
     `What would you like to do next?`,
-    [
-      { label: "🔄 Different format, same topic", value: `/formats ${path.slug}` },
-      ...followUpButtons()
-    ]
+    buttons
   );
 }
 
@@ -918,7 +960,7 @@ async function deliverForStyle(ctx, style, preferredFormat, path) {
       ctx,
       `✅ *${asset.title}*\n\n${asset.description}\n\n📎 Listen here:\n${asset.url}\n\n` +
       `What would you like to do next?`,
-      followUpButtons()
+      [{ label: "⬇️ Save to device", value: `/downloadasset ${asset.id}` }, ...followUpButtons()]
     );
     return;
   }
@@ -1104,12 +1146,16 @@ async function deliverPlaylistFormat(ctx, paths, format, label) {
     : `✅ Playlist ready — *${assetIds.length}* course${assetIds.length === 1 ? "" : "s"} queued up.\n\n`;
   const courseList = includedPaths.map((p, idx) => `${idx + 1}. ${p.title}`).join("\n");
 
+  const buttons = format !== "video"
+    ? [{ label: "⬇️ Save all to device", value: `/downloadplaylist ${assetIds.join(",")}` }, ...followUpButtons()]
+    : followUpButtons();
+
   await sendChoicesTracked(
     ctx,
     `${titleLine}${courseList}\n\n` +
     `📎 Start here:\n${PUBLIC_BASE_URL}/playlist/${assetIds.join(",")}\n\n` +
     `What would you like to do next?`,
-    followUpButtons()
+    buttons
   );
 }
 
@@ -1279,6 +1325,91 @@ onCommand("playlistformat", async (ctx) => {
   }
 
   await deliverPlaylistFormat(ctx, paths, format, label);
+});
+
+onCommand("downloadasset", async (ctx) => {
+  const assetId = ctx.argText.trim();
+  const { data: asset, error } = await supabase
+    .from("media_assets")
+    .select("bucket, storage_path, mime_type, asset_type, title")
+    .eq("id", assetId)
+    .eq("is_published", true)
+    .maybeSingle();
+
+  if (error || !asset) {
+    await ctx.sendText("😕 I couldn't find that content anymore.");
+    return;
+  }
+  if (HLS_MIME_TYPES.has((asset.mime_type || "").toLowerCase())) {
+    await ctx.sendText("😕 Video can't be sent as a direct file — it's streamed in many pieces, not one downloadable file. Use the link instead.");
+    return;
+  }
+  if (asset.storage_path.endsWith("/")) {
+    await ctx.sendText("😕 This slide deck is a set of separate slide images rather than one file — download individual slides from the deck viewer link instead.");
+    return;
+  }
+
+  const result = await sendAssetAsAttachment(ctx, asset).catch((err) => {
+    console.error("Failed to send asset attachment:", err.message);
+    return { sent: false, reason: "error" };
+  });
+  if (!result.sent) {
+    await ctx.sendText(
+      result.reason === "too_large"
+        ? "😕 That file's too large to send directly here — use the link instead."
+        : "😕 Something went wrong sending that file — try the link instead."
+    );
+  }
+});
+
+onCommand("downloadplaylist", async (ctx) => {
+  const ids = ctx.argText.trim().split(",").map((s) => s.trim()).filter(Boolean);
+  if (ids.length === 0) {
+    await ctx.sendText("Sorry, I lost track of that playlist. Try again from /findcourse.");
+    return;
+  }
+
+  const { data: assets, error } = await supabase
+    .from("media_assets")
+    .select("id, bucket, storage_path, mime_type, asset_type, title")
+    .in("id", ids)
+    .eq("is_published", true);
+
+  if (error || !assets || assets.length === 0) {
+    await ctx.sendText("😕 I couldn't find that playlist's content anymore.");
+    return;
+  }
+
+  const byId = new Map(assets.map((a) => [a.id, a]));
+  const ordered = ids.map((id) => byId.get(id)).filter(Boolean);
+
+  if (HLS_MIME_TYPES.has((ordered[0]?.mime_type || "").toLowerCase())) {
+    await ctx.sendText("😕 Video can't be sent as direct files — they're streamed in many pieces, not one downloadable file each. Use the playlist link instead.");
+    return;
+  }
+
+  await ctx.sendText(`⬇️ Sending ${ordered.length} file${ordered.length === 1 ? "" : "s"} to you now — this'll take a few seconds...`);
+
+  let sentCount = 0;
+  let tooLargeCount = 0;
+  for (const asset of ordered) {
+    const result = await sendAssetAsAttachment(ctx, asset).catch((err) => {
+      console.error(`Failed to send playlist asset ${asset.id}:`, err.message);
+      return { sent: false, reason: "error" };
+    });
+    if (result.sent) sentCount++;
+    else if (result.reason === "too_large") tooLargeCount++;
+    // the SDK enforces a 1s per-room send cooldown — space these out so
+    // later files in the playlist aren't silently dropped by it
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+  }
+
+  const skippedNote = tooLargeCount > 0 ? ` (${tooLargeCount} skipped — too large to send directly, use the playlist link for those)` : "";
+  await ctx.sendText(
+    sentCount > 0
+      ? `✅ Sent ${sentCount} of ${ordered.length} file${ordered.length === 1 ? "" : "s"}${skippedNote}.`
+      : "😕 Something went wrong sending those files — try the playlist link instead."
+  );
 });
 
 onCommand("role", async (ctx) => {
